@@ -12,6 +12,7 @@ from sanic.log import logger
 from websockets.legacy.protocol import WebSocketCommonProtocol
 
 from config import WEBSOCKETS_TIME_OUT
+from speechServer.exception.ParameterException import ParametersException
 from speechServer.pojo.ResponseBody import ResponseBody
 from speechServer.utils.SignatureUtils import check_signature
 from speechServer.utils.snowflake import IdWorker
@@ -41,12 +42,13 @@ client = dict()
 @app.websocket("/asr", version=1)
 async def handle(request, ws):
     args = request.args
-    print(type(ws))
+    session_id = IdWorker().get_id()
+
     # check_signature 鉴权算法查看文档
     if check_signature(args):
 
         while True:
-            session_id = IdWorker().get_id()
+
             # 注册到客户端字典里面
             client[session_id] = queue.Queue()
             # disconnect if receive nothing in WEBSOCKETS_TIME_OUT seconds
@@ -55,22 +57,21 @@ async def handle(request, ws):
                 message = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKETS_TIME_OUT)
                 # handle the receive messages
                 # 处理接受到的数据
-                logger.info(f"message: {message}")
+                logger.info(f"{session_id} send message: {message}")
                 if message.lower() == "ping":
                     # answer if receive the heartbeats
                     await ws.send('pong')
                     continue
                 else:
                     # handle the messages except heartbeats
-                    data = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKETS_TIME_OUT)
-                    data = json.loads(data)
 
-                    await ws.send(f"{args}")
+                    data = json.loads(message)
+                    await handle_data_from_client(data, ws)
 
             except asyncio.TimeoutError:
                 # Timeout handle
                 # 处理超时
-                await ws.send(ResponseBody(code=408, message="Connection Timeout").json())
+                await ws.send(ResponseBody(code=408, message="Connection Timeout", sid=session_id).json())
                 await ws.close(408, "TIMEOUT")
                 break
 
@@ -81,12 +82,16 @@ async def handle(request, ws):
                 break
 
             except json.decoder.JSONDecodeError:
-                await ws.send(ResponseBody(code=408, message="Connection Timeout").json())
+                await ws.send(ResponseBody(code=408, message="The data must be json format", sid=session_id).json())
                 await ws.close(403, "the String must be json format")
                 break
 
+            except ParametersException as param_exception:
+                await ws.send(ResponseBody(code=403, message=param_exception.__str__(), sid=session_id).json())
+                await ws.close(403, param_exception.__str__())
+                break
     else:
-        await ws.send(ResponseBody(code=401, message="Unauthorized").json())
+        await ws.send(ResponseBody(code=401, message="Unauthorized", sid=session_id).json())
         await ws.close(401, "Unauthorized")
 
 
@@ -100,7 +105,7 @@ async def handle_messages_from_redis(ws: WebSocketCommonProtocol):
     pass
 
 
-async def handle_data_from_client(data, ws):
+async def handle_data_from_client(data: dict, ws: WebSocketCommonProtocol):
     """
     handle the data from client
     处理客户端的数据
@@ -111,7 +116,20 @@ async def handle_data_from_client(data, ws):
     :param data: the data of client
     :param ws: the websocket instance to send and receive
     :return:
+    :exception:  ParametersException
     """
+    # validate data
+    language_code = data.get("language_code", None)
+    audio_format = data.get("format", None)
+    status = data.get("status", None)
+    data = data.get("data", None)
+
+    # check every parameters is exist
+    # 检查每个参数是否存在
+    for param_name in ["language_code", "audio_format", "status", "data"]:
+        if locals().get(param_name, None) is None:
+            raise ParametersException(f"Parameters '{param_name}' is missing")
+
 
 
 if __name__ == "__main__":
