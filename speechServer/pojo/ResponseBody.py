@@ -7,27 +7,19 @@ import json
 
 
 class ResponseBody:
-    def __init__(self, code: int, message: str, data: str = "", sid: str = ""):
+    def __init__(self, code: int, message: str, data: str = "", task_id: str = ""):
         self.__code = code
         self.__message = message
         self.__message = message
         self.__data = data
-        self.__sid = sid
-
-    def __str__(self):
-        return {
-            "code": self.__code,
-            "message": self.__message,
-            "data": self.__data,
-            "sid": self.__sid,
-        }.__str__()
+        self.__task_id = task_id
 
     def __dict__(self):
         return {
             "code": self.__code,
             "message": self.__message,
             "data": self.__data,
-            "sid": self.__sid,
+            "task_id": self.__task_id
         }
 
     def json(self):

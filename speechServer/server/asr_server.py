@@ -8,11 +8,12 @@ import queue
 import threading
 
 import redis
-from sanic import Sanic
+import sanic
+from sanic import Sanic, text
 import asyncio
 from sanic.log import logger
 from websockets.legacy.protocol import WebSocketCommonProtocol
-
+import concurrent.futures
 from config import *
 from speechServer.exception.ParameterException import ParametersException
 from speechServer.pojo.ResponseBody import ResponseBody
@@ -31,6 +32,14 @@ app.config.WEBSOCKET_TIMEOUT = 10
 clients = dict()
 rds = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT)
 
+
+@app.exception(sanic.exceptions.ServerError)
+async def catch_anything(request, exception):
+    pass
+
+@app.exception(Exception)
+async def catch_anything(request, exception):
+    print(exception)
 
 @app.websocket("/asr", version=1)
 async def handle(request, ws):
@@ -51,7 +60,9 @@ async def handle(request, ws):
                 # 处理接受到的数据
                 message = await asyncio.wait_for(ws.recv(), timeout=WEBSOCKETS_TIME_OUT)
 
-                logger.info(f"{session_id} send message: {message}")
+                logger.info(f"client-{session_id} send message: {message}")
+
+                # todo 待加入 帧 ping 支持
                 if message.lower() == "ping":
                     # answer if receive the heartbeats
                     # 处理心跳
@@ -67,7 +78,7 @@ async def handle(request, ws):
                 # Timeout handle
                 # 处理超时
                 del clients[session_id]
-                await ws.send(ResponseBody(code=408, message="Connection Timeout", sid=session_id).json())
+                await ws.send(ResponseBody(code=408, message="Connection Timeout", task_id=session_id).json())
                 await ws.close(408, "TIMEOUT")
                 break
 
@@ -76,22 +87,26 @@ async def handle(request, ws):
                 # 处理被客户端主动关闭连接
                 logger.info("client closed the connection")
                 del clients[session_id]
+
+                if not ws.closed:
+                    await ws.send(ResponseBody(code=403, message="The websocket disconnect", task_id=session_id).json())
+                    await ws.close(403, "The websocket disconnect")
                 break
 
             except json.decoder.JSONDecodeError:
                 del clients[session_id]
-                await ws.send(ResponseBody(code=408, message="The data must be json format", sid=session_id).json())
+                await ws.send(ResponseBody(code=403, message="The data must be json format", task_id=session_id).json())
                 await ws.close(403, "the String must be json format")
                 break
 
             except ParametersException as param_exception:
                 del clients[session_id]
-                await ws.send(ResponseBody(code=403, message=param_exception.__str__(), sid=session_id).json())
+                await ws.send(ResponseBody(code=403, message=param_exception.__str__(), task_id=session_id).json())
                 await ws.close(403, param_exception.__str__())
                 break
     else:
         logger.info(f"{request}")
-        await ws.send(ResponseBody(code=401, message="Unauthorized", sid=session_id).json())
+        await ws.send(ResponseBody(code=401, message="Unauthorized", task_id=session_id).json())
         await ws.close(401, "Unauthorized")
 
 
@@ -123,13 +138,22 @@ async def handle_data_from_client(data: dict, ws: WebSocketCommonProtocol, sessi
 
     if data.lower() == "eof":
         # recognition end,
-        await ws.send(ResponseBody(code=200, message="Speech recognition finished", sid=session_id).json())
+        await ws.send(ResponseBody(code=200, message="Speech recognition finished", task_id=session_id).json())
         await ws.close(200, "Speech recognition finished")
         del clients[session_id]
 
     # publish to redis
-    language_code_list = rds.get("language_code")
-    logger.info(f"load language list")
+    # 发送给redis
+    language_code_list = json.loads(str(rds.get("languages_code"), encoding='utf-8'))
+    print(language_code_list)
+    logger.debug(f"load language list: {language_code_list}")
+    channel = language_code_list.get(language_code, {"engine": "google"}).get("engine")
+    rds.publish(channel, TranscriptBody(
+        task_id=session_id,
+        result=data,
+        speech_type=status,
+        speech_id='auto'
+    ).json())
 
 
 async def deliver_data_from_redis_to_client():
@@ -142,18 +166,65 @@ async def deliver_data_from_redis_to_client():
 
     all_channels = None
     while True:
+        # logger.debug(f"channel list: {clients}")
+        # print(str(threading.enumerate()))
+        if len(clients) == 0:
+            await asyncio.sleep(0.4)
+            continue
+
         new_all_channels = json.loads(rds.get("ALL_CHANNELS"))
+
+        # 只有在第一次或者，当redis里面的ALL_CHANNELS 改变的时候才会运行以下代码
         if all_channels != new_all_channels:
             all_channels = new_all_channels
 
-            for channel in all_channels:
-                task = threading.Thread(target=send_data_to_client_on_one_channel, args=(channel,))
-                task.start()
+            def send(channel):
+                loop = asyncio.new_event_loop()
+                # loop.call_soon_threadsafe(send_data_to_client_on_one_channel(channel))
+                future = asyncio.run(send_data_to_client_on_one_channel(channel))
+                print(future.result())
+                # loop.close()
+
+            tasks_list = []
+            for key, value in all_channels.items():
+                logger.info(f"current channel : {key}")
+                # tasks_list.append(asyncio.ensure_future(send_data_to_client_on_one_channel(value['result'])))
+                await send_data_to_client_on_one_channel(value['result'])
+                # loop.call_soon_threadsafe(send_data_to_client_on_one_channel, value['result'])
+                # loop.run_forever()
+                # send_data = asyncio.create_task(send_data_to_client_on_one_channel(value['result']))
+                # task = threading.Thread(target=send)
+
+                # loop = asyncio.get_running_loop()
+                # asyncio.set_event_loop(loop)
+                # task = threading.Thread(target=loop.run_until_complete)
+
+                # asyncio.run_coroutine_threadsafe(send_data_to_client_on_one_channel(value['result']), loop)
+                # task.start()
+                # loop = asyncio.get_event_loop()
+                # with concurrent.futures.ThreadPoolExecutor() as pool:
+                #     await loop.run_in_executor(
+                #         pool, send, value['result'])
+
+                # task = threading.Thread(target=send, args=(value['result'],))
+                # asyncio.run_coroutine_threadsafe(task,)
+
+                # threading.Thread(target=asyncio.new_event_loop().run_until_complete(send_data_to_client_on_one_channel(value['result']))).start()
+
+                # thrd = threading.Thread(
+                #     target=send,
+                #     args=(value['result'],),
+                #     name="AsyncIO Thread"
+                # )
+                # thrd.start()
+                # app.add_task(send_data_to_client_on_one_channel(value['result']))
+            # await loop.run_until_complete(asyncio.wait(tasks_list))
+
         else:
             await asyncio.sleep(5)
 
 
-def send_data_to_client_on_one_channel(channel: str):
+async def send_data_to_client_on_one_channel(channel: str):
     """
     if websockets client exist and not closed, sent data to client identified by session id
     :param channel:
@@ -169,33 +240,49 @@ def send_data_to_client_on_one_channel(channel: str):
         logger.info(f"channel {channel} receive: {item}")
 
         if item is None or item['type'] != "message":
+            await asyncio.sleep(0.01)
             continue
 
+        # todo 这里要改逻辑
         output = json.loads(item['data'])
-        sid = output["sid"]
+        print(output)
+        speech_id = output["speech_id"]
+        task_id = output["task_id"]
         result = output["result"]
-        if result['type'] in ("final"):
-            logger.info("收到redis的结果{result}个字符".format(result=len(result["result"])), sid, sep=";")
+        _type = output["type"]
 
-            ws_client = clients.get(sid, None)
+        if _type in ("final"):
+            logger.info("收到redis的结果{result}个字符".format(result=len(result)))
+
+            ws_client = clients.get(task_id, None)
+            print(f"now client is  {ws_client}, read to send message")
             if ws_client is None:
-                logger.info(f"sid: {sid} is not exist")
-                break
+                logger.debug(f"client list : {clients}")
+                logger.info(f"sid: {task_id} is not exist")
+                continue
             if ws_client.closed:
-                logger.info(f"sid: {sid} is closed")
-                clients.pop(sid)
-                break
-            TranscriptBody(task_id=sid, data=result["data"], speech_type=result["type"])
+                logger.info(f"client id: {task_id} is closed")
+                clients.pop(task_id)
+                continue
 
-            ws_client.send(ResponseBody(code=200,
-                                        message="SUCCESS",
-                                        sid=sid,
-                                        data=TranscriptBody(task_id=sid, data=result["data"], speech_type=result["type"]).json()
-                                        ).json())
+            await ws_client.send(ResponseBody(code=200,
+                                              message="SUCCESS",
+                                              task_id=task_id,
+                                              data=TranscriptBody(task_id=task_id,
+                                                                  result=result,
+                                                                  speech_type=_type,
+                                                                  speech_id=speech_id
+                                                                  ).json()).json())
+
 
     pubsub.unsubscribe(channel)
     logger.info(f"This is channel: {channel}, subscribe redis finished")
 
+
 if __name__ == "__main__":
-    app.add_task(deliver_data_from_redis_to_client())
+    # thrd = threading.Thread(
+    #     target=deliver_data_from_redis_to_client,
+    #     name="AsyncIO Thread"
+    # )
+    # thrd.start()
     app.run(host="0.0.0.0", port=8080, debug=True)
